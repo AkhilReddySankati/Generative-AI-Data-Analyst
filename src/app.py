@@ -10,7 +10,13 @@ from dotenv import load_dotenv
 import pickle
 import io
 
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import (
+    train_test_split,
+    cross_validate,
+    StratifiedKFold,
+    KFold
+)
+from sklearn.base import clone
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.utils import resample
@@ -18,10 +24,14 @@ from sklearn.utils import resample
 # SMOTE needs the optional 'imbalanced-learn' package - degrade gracefully
 # if it's not installed rather than crashing the whole app
 try:
-    from imblearn.over_sampling import SMOTE
+    from imblearn.over_sampling import SMOTE, RandomOverSampler
+    from imblearn.under_sampling import RandomUnderSampler
+    from imblearn.pipeline import Pipeline as ImbPipeline
     SMOTE_AVAILABLE = True
+    IMBLEARN_AVAILABLE = True
 except ImportError:
     SMOTE_AVAILABLE = False
+    IMBLEARN_AVAILABLE = False
 from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
@@ -53,6 +63,288 @@ else:
     gemini_model = None
 
 # -----------------------------------
+# HELPER FUNCTIONS
+# -----------------------------------
+
+def build_model(problem_type, imbalance_method, custom_class_weights):
+    """Return an UNTRAINED Random Forest configured for the problem."""
+
+    if problem_type == "Regression":
+
+        return RandomForestRegressor(
+            n_estimators=100,
+            random_state=42
+        )
+
+    classifier_kwargs = {
+        "n_estimators": 100,
+        "random_state": 42
+    }
+
+    # class_weight='balanced' reweights errors on the minority class -
+    # no rows added or removed, just applied at model level
+    if imbalance_method.startswith("Use class_weight"):
+        classifier_kwargs["class_weight"] = "balanced"
+
+    # Custom cost-sensitive ratio - user-supplied weight per class
+    elif imbalance_method.startswith("Cost-sensitive") and custom_class_weights:
+        classifier_kwargs["class_weight"] = custom_class_weights
+
+    return RandomForestClassifier(**classifier_kwargs)
+
+
+def run_cross_validation(model, X_train, y_train, problem_type,
+                         imbalance_method, n_splits=5):
+    """
+    K-fold cross-validation on the TRAINING split only (the test split is
+    never touched). Returns (table of mean/std/per-fold scores, note).
+
+    Resampling (SMOTE / oversample / undersample) is done inside each fold
+    with an imblearn Pipeline, so each validation fold keeps real class
+    proportions and never contains synthetic or duplicated rows.
+    """
+
+    estimator = clone(model)
+    note = None
+
+    if problem_type == "Classification":
+
+        min_class_count = int(y_train.value_counts().min())
+        n_splits = min(n_splits, min_class_count)
+
+        if n_splits < 2:
+            return None, (
+                "Cross-validation skipped: the smallest class has fewer than "
+                "2 rows in the training data."
+            )
+
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        scoring = {
+            "Accuracy": "accuracy",
+            "F1 (macro)": "f1_macro",
+            "ROC-AUC": "roc_auc" if y_train.nunique() == 2 else "roc_auc_ovr",
+        }
+
+        sampler = None
+
+        if imbalance_method.startswith("SMOTE"):
+
+            # Each fold trains on (k-1)/k of the data, so the minority
+            # class is smaller there than in the full training split
+            fold_minority = int(min_class_count * (n_splits - 1) / n_splits)
+            k_neighbors = min(5, fold_minority - 1)
+
+            if k_neighbors >= 1:
+                sampler = SMOTE(k_neighbors=k_neighbors, random_state=42)
+            else:
+                note = (
+                    "Minority class too small for SMOTE inside each fold - "
+                    "cross-validation ran without balancing."
+                )
+
+        elif imbalance_method.startswith(("Oversample", "Undersample")):
+
+            if IMBLEARN_AVAILABLE:
+                sampler = (
+                    RandomOverSampler(random_state=42)
+                    if imbalance_method.startswith("Oversample")
+                    else RandomUnderSampler(random_state=42)
+                )
+            else:
+                note = (
+                    "Install `imbalanced-learn` to apply the same "
+                    "over/undersampling inside each fold - cross-validation "
+                    "ran without balancing."
+                )
+
+        if sampler is not None:
+            estimator = ImbPipeline([
+                ("balance", sampler),
+                ("model", estimator)
+            ])
+
+    else:
+
+        cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        scoring = {
+            "R²": "r2",
+            "RMSE": "neg_root_mean_squared_error",
+            "MAE": "neg_mean_absolute_error",
+        }
+
+    try:
+
+        scores = cross_validate(
+            estimator,
+            X_train,
+            y_train,
+            cv=cv,
+            scoring=scoring
+        )
+
+    except Exception as cv_error:
+        return None, f"Cross-validation failed: {cv_error}"
+
+    rows = []
+    failed_metrics = []
+
+    for metric_name in scoring:
+
+        fold_scores = scores[f"test_{metric_name}"]
+
+        # sklearn returns errors as negative numbers ("higher is better"),
+        # flip them back so RMSE/MAE read normally
+        if scoring[metric_name].startswith("neg_"):
+            fold_scores = -fold_scores
+
+        if np.isnan(fold_scores).any():
+            failed_metrics.append(metric_name)
+
+        rows.append({
+            "Metric": metric_name,
+            "Mean": round(float(np.mean(fold_scores)), 4),
+            "Std": round(float(np.std(fold_scores)), 4),
+            "Per-fold scores": ", ".join(f"{s:.3f}" for s in fold_scores),
+        })
+
+    if failed_metrics:
+        failed_note = (
+            f"Some folds could not be scored for {failed_metrics} "
+            f"(shown as NaN) - check the terminal for the warning."
+        )
+        note = f"{note} {failed_note}" if note else failed_note
+
+    return pd.DataFrame(rows), note
+
+
+def compute_shap_importance(model, X_test):
+    """Mean |SHAP value| per feature, on up to 200 test rows."""
+
+    # Cap sample size for speed - SHAP on tree models is
+    # fast but still scales with rows x features x trees
+    shap_sample = X_test.sample(
+        n=min(200, len(X_test)),
+        random_state=42
+    )
+
+    explainer = shap.TreeExplainer(model)
+    raw_shap_values = explainer.shap_values(shap_sample)
+
+    # Normalize across shap API versions / binary vs
+    # multiclass vs regression into one
+    # (n_samples, n_features) array of attributions
+    if isinstance(raw_shap_values, list):
+        # Older API: list of per-class arrays
+        if len(raw_shap_values) == 2:
+            shap_matrix = raw_shap_values[1]
+        else:
+            shap_matrix = np.mean(
+                [np.abs(sv) for sv in raw_shap_values],
+                axis=0
+            )
+    else:
+        shap_array = np.array(raw_shap_values)
+        if shap_array.ndim == 3:
+            # Newer API: (n_samples, n_features, n_classes)
+            if shap_array.shape[-1] == 2:
+                shap_matrix = shap_array[:, :, 1]
+            else:
+                shap_matrix = np.abs(shap_array).mean(axis=-1)
+        else:
+            shap_matrix = shap_array
+
+    mean_abs_shap = np.abs(shap_matrix).mean(axis=0)
+
+    return pd.DataFrame({
+        "Feature": shap_sample.columns,
+        "Mean |SHAP value|": mean_abs_shap
+    }).sort_values(
+        by="Mean |SHAP value|",
+        ascending=False
+    )
+
+
+def build_gemini_summary(results):
+    """
+    Text summary sent to Gemini: ORIGINAL data statistics (before encoding
+    and capping, so the LLM doesn't misread encoded numbers or capped
+    decimals) plus the model's actual results.
+    """
+
+    raw = results["raw_data_for_summary"]
+    target_column = results["target_column"]
+
+    lines = [
+        f"Dataset Shape (original, after removing excluded columns): {raw.shape}",
+        "",
+        f"Columns: {list(raw.columns)}",
+        "",
+        "Data Types:",
+        raw.dtypes.to_string(),
+        "",
+        "Missing Values:",
+        raw.isnull().sum().to_string(),
+        "",
+        "Statistics (original data):",
+        raw.describe(include="all").to_string(),
+        "",
+        f"Target Column: {target_column}",
+        f"Problem Type: {results['problem_type']}",
+    ]
+
+    if results["problem_type"] == "Classification":
+        lines += [
+            "",
+            "Target class distribution (original data):",
+            raw[target_column].value_counts().to_string(),
+        ]
+
+    lines += [
+        "",
+        "Preprocessing applied:",
+        f"- Class balancing: {results['imbalance_method']}",
+        f"- Feature scaling: {'StandardScaler' if results['apply_scaling'] else 'none'}",
+        f"- Outlier capping applied to: {results['capped_columns'] or 'none'}",
+        "- Categorical columns label-encoded for the model",
+        "",
+        "Model: Random Forest (100 trees), 80/20 train-test split",
+        "",
+        "Test-set metrics:",
+    ]
+
+    for name, value in results["metrics"].items():
+        lines.append(f"- {name}: {value:.4f}")
+
+    if results["cm"] is not None:
+        lines += [
+            "",
+            f"Confusion matrix (rows = actual, columns = predicted; "
+            f"labels {results['class_labels']}):",
+            str(results["cm"]),
+            "",
+            "Classification report:",
+            results["report_df"].to_string(),
+        ]
+
+    if results["cv_df"] is not None:
+        lines += [
+            "",
+            "5-fold cross-validation on training data:",
+            results["cv_df"].to_string(index=False),
+        ]
+
+    lines += [
+        "",
+        "Top 10 Important Features (Random Forest importance):",
+        results["top_10_features"].to_string(index=False),
+    ]
+
+    return "\n".join(lines)
+
+
+# -----------------------------------
 # PAGE CONFIGURATION
 # -----------------------------------
 
@@ -65,8 +357,8 @@ st.set_page_config(
 # INITIALIZE SESSION STATE
 # -----------------------------------
 
-if "trained" not in st.session_state:
-    st.session_state["trained"] = False
+if "results" not in st.session_state:
+    st.session_state["results"] = None
 
 st.title("🤖 Generic AI Data Analyst")
 st.write(
@@ -711,168 +1003,576 @@ if uploaded_file is not None:
         )
     )
 
+    # -----------------------------------
+    # CROSS-VALIDATION OPTION
+    # -----------------------------------
+
+    run_cv = st.checkbox(
+        "Run 5-fold cross-validation on the training data",
+        value=True,
+        help=(
+            "Trains and scores the model 5 times on different slices of the "
+            "training data and reports the average and spread. More reliable "
+            "than a single train/test split, but takes about 5x longer."
+        )
+    )
+
+    # -----------------------------------
+    # TRAIN BUTTON
+    # -----------------------------------
+    # Streamlit reruns this whole script on EVERY click (SHAP checkbox,
+    # Gemini button, download buttons). On those reruns st.button(...) is
+    # False, so anything drawn inside this block would vanish. That's why
+    # this block only TRAINS and SAVES results into st.session_state; the
+    # results are drawn further down, outside the button block.
+
     if st.button("Clean Data and Train Model"):
 
-        # Create copy
-        data = df.copy()
+        with st.spinner("Cleaning data and training model..."):
 
-        # -----------------------------------
-        # REMOVE UNWANTED COLUMNS
-        # -----------------------------------
+            # Create copy
+            data = df.copy()
 
-        # Safety net: never drop the target column even if it
-        # somehow ended up in the excluded list
-        columns_to_drop = [
-            col for col in excluded_columns if col != target_column
-        ]
+            # -----------------------------------
+            # REMOVE UNWANTED COLUMNS
+            # -----------------------------------
 
-        if columns_to_drop:
-            data.drop(columns=columns_to_drop, inplace=True)
+            # Safety net: never drop the target column even if it
+            # somehow ended up in the excluded list
+            columns_to_drop = [
+                col for col in excluded_columns if col != target_column
+            ]
 
-        # -----------------------------------
-        # REMOVE DUPLICATE ROWS
-        # -----------------------------------
+            if columns_to_drop:
+                data.drop(columns=columns_to_drop, inplace=True)
 
-        if remove_duplicates:
-            data.drop_duplicates(inplace=True)
+            # Untouched copy (before capping/encoding) for the Gemini summary,
+            # so the LLM describes the real data, not the processed version
+            raw_data_for_summary = data.copy()
 
-        # -----------------------------------
-        # HANDLE OUTLIERS (IQR METHOD)
-        # -----------------------------------
+            # -----------------------------------
+            # REMOVE DUPLICATE ROWS
+            # -----------------------------------
 
-        if handle_outliers:
+            if remove_duplicates:
+                data.drop_duplicates(inplace=True)
 
-            for col in data.select_dtypes(include=[np.number]).columns:
+            # -----------------------------------
+            # HANDLE OUTLIERS (IQR METHOD)
+            # -----------------------------------
 
-                # Skip target column - don't distort what we're predicting
+            capped_columns = []
+
+            if handle_outliers:
+
+                for col in data.select_dtypes(include=[np.number]).columns:
+
+                    # Skip target column - don't distort what we're predicting
+                    if col == target_column:
+                        continue
+
+                    is_integer_col = pd.api.types.is_integer_dtype(data[col])
+
+                    # Skip small whole-number columns (counts, flags,
+                    # ratings like 0-5). IQR bounds such as 2.5 would turn
+                    # them into fake decimals and distort their meaning.
+                    if is_integer_col and data[col].nunique() <= 10:
+                        continue
+
+                    Q1 = data[col].quantile(0.25)
+                    Q3 = data[col].quantile(0.75)
+                    IQR = Q3 - Q1
+
+                    lower_bound = Q1 - 1.5 * IQR
+                    upper_bound = Q3 + 1.5 * IQR
+
+                    # Keep whole-number columns whole: widen the bounds to
+                    # the nearest integers instead of clipping to decimals
+                    if is_integer_col:
+                        lower_bound = np.floor(lower_bound)
+                        upper_bound = np.ceil(upper_bound)
+
+                    # Cap (Winsorize) instead of dropping rows,
+                    # so we don't lose data from other columns
+                    clipped = data[col].clip(
+                        lower=lower_bound,
+                        upper=upper_bound
+                    )
+
+                    if is_integer_col:
+                        clipped = clipped.astype(data[col].dtype)
+
+                    if not clipped.equals(data[col]):
+                        capped_columns.append(col)
+
+                    data[col] = clipped
+
+            # -----------------------------------
+            # REMOVE ROWS WHERE TARGET IS MISSING
+            # -----------------------------------
+
+            data.dropna(
+                subset=[target_column],
+                inplace=True
+            )
+
+            # -----------------------------------
+            # HANDLE MISSING VALUES
+            # -----------------------------------
+
+            for col in data.columns:
+
+                # Skip target column
                 if col == target_column:
                     continue
 
-                Q1 = data[col].quantile(0.25)
-                Q3 = data[col].quantile(0.75)
-                IQR = Q3 - Q1
+                # Only process columns with NaN
+                if data[col].isnull().sum() > 0:
 
-                lower_bound = Q1 - 1.5 * IQR
-                upper_bound = Q3 + 1.5 * IQR
+                    # CATEGORICAL / OBJECT COLUMN
+                    if (
+                        data[col].dtype == "object"
+                        or data[col].dtype == "category"
+                    ):
 
-                # Cap (Winsorize) instead of dropping rows,
-                # so we don't lose data from other columns
-                data[col] = data[col].clip(
-                    lower=lower_bound,
-                    upper=upper_bound
+                        # Replace NaN with Mode
+                        data[col] = data[col].fillna(
+                            data[col].mode()[0]
+                        )
+
+                    # NUMERICAL COLUMN
+                    else:
+
+                        # Check skewness
+                        skewness = data[col].skew()
+
+                        # Use Median if skewed
+                        if abs(skewness) >= 1:
+                            data[col] = data[col].fillna(
+                                data[col].median()
+                            )
+
+                        # Use Mean if approximately normal
+                        else:
+                            data[col] = data[col].fillna(
+                                data[col].mean()
+                            )
+
+            # -----------------------------------
+            # HANDLE TARGET COLUMN
+            # -----------------------------------
+
+            target_encoder = None
+
+            unique_target_values = set(
+                data[target_column].dropna().unique()
+            )
+
+            # Binary numeric target (only 0 and 1) -> treat as classification,
+            # not regression, even though the dtype is numeric
+            is_binary_numeric_target = (
+                pd.api.types.is_numeric_dtype(data[target_column])
+                and len(unique_target_values) == 2
+                and unique_target_values.issubset({0, 1})
+            )
+
+            if (
+                data[target_column].dtype == "object"
+                or data[target_column].dtype == "category"
+            ):
+
+                target_encoder = LabelEncoder()
+
+                data[target_column] = target_encoder.fit_transform(
+                    data[target_column]
                 )
 
-        # -----------------------------------
-        # REMOVE ROWS WHERE TARGET IS MISSING
-        # -----------------------------------
+                problem_type = "Classification"
 
-        data.dropna(
-            subset=[target_column],
-            inplace=True
-        )
+            elif is_binary_numeric_target:
 
-        # -----------------------------------
-        # HANDLE MISSING VALUES
-        # -----------------------------------
+                # Already 0/1, just make sure it's a clean integer type
+                data[target_column] = data[target_column].astype(int)
 
-        for col in data.columns:
+                problem_type = "Classification"
 
-            # Skip target column
-            if col == target_column:
-                continue
+            else:
+                problem_type = "Regression"
 
-            # Only process columns with NaN
-            if data[col].isnull().sum() > 0:
+            # -----------------------------------
+            # ENCODE OBJECT COLUMNS
+            # -----------------------------------
 
-                # CATEGORICAL / OBJECT COLUMN
-                if (
-                    data[col].dtype == "object"
-                    or data[col].dtype == "category"
-                ):
+            categorical_columns = data.select_dtypes(
+                include=["object", "category"]
+            ).columns
 
-                    # Replace NaN with Mode
-                    data[col] = data[col].fillna(
-                        data[col].mode()[0]
+            feature_encoders = {}
+
+            for col in categorical_columns:
+
+                encoder = LabelEncoder()
+
+                data[col] = encoder.fit_transform(
+                    data[col].astype(str)
+                )
+
+                feature_encoders[col] = encoder
+
+            # -----------------------------------
+            # SPLIT FEATURES AND TARGET
+            # -----------------------------------
+
+            X = data.drop(
+                target_column,
+                axis=1
+            )
+
+            y = data[target_column]
+
+            # -----------------------------------
+            # TRAIN TEST SPLIT
+            # -----------------------------------
+
+            X_train, X_test, y_train, y_test = train_test_split(
+                X,
+                y,
+                test_size=0.2,
+                random_state=42
+            )
+
+            # -----------------------------------
+            # FEATURE SCALING
+            # -----------------------------------
+
+            scaler = None
+
+            if apply_scaling:
+
+                # Only scale columns that were originally numeric
+                # (leaves label-encoded categorical columns untouched)
+                numeric_feature_cols = [
+                    col for col in numeric_cols if col in X.columns
+                ]
+
+                if len(numeric_feature_cols) > 0:
+
+                    scaler = StandardScaler()
+
+                    # Scaled values are decimals - convert whole-number
+                    # columns to float first (newer pandas refuses to write
+                    # decimals into an int64 column)
+                    float_types = {col: "float64" for col in numeric_feature_cols}
+                    X_train = X_train.astype(float_types)
+                    X_test = X_test.astype(float_types)
+
+                    # Fit on train only, then transform both -
+                    # avoids leaking test-set statistics into training
+                    X_train.loc[:, numeric_feature_cols] = scaler.fit_transform(
+                        X_train[numeric_feature_cols]
                     )
 
-                # NUMERICAL COLUMN
+                    X_test.loc[:, numeric_feature_cols] = scaler.transform(
+                        X_test[numeric_feature_cols]
+                    )
+
+            # -----------------------------------
+            # BUILD MODEL (untrained)
+            # -----------------------------------
+
+            model = build_model(
+                problem_type,
+                imbalance_method,
+                custom_class_weights
+            )
+
+            # -----------------------------------
+            # CROSS-VALIDATION (training split only)
+            # -----------------------------------
+            # Runs BEFORE balancing, on the untouched training split.
+            # Any resampling (SMOTE / over / under) happens inside each fold
+            # via an imblearn Pipeline, so validation folds keep real class
+            # proportions - same rule as the final test set.
+
+            cv_df, cv_note = (None, None)
+
+            if run_cv:
+                cv_df, cv_note = run_cross_validation(
+                    model,
+                    X_train,
+                    y_train,
+                    problem_type,
+                    imbalance_method
+                )
+
+            # -----------------------------------
+            # CLASS IMBALANCE HANDLING
+            # -----------------------------------
+
+            # Only applies to classification, and only touches the TRAINING
+            # split - never the test split, so evaluation stays honest and
+            # reflects real-world class proportions.
+
+            balancing_note = None
+
+            if problem_type == "Classification" and imbalance_method.startswith("SMOTE"):
+
+                minority_count = y_train.value_counts().min()
+
+                # SMOTE needs at least k_neighbors+1 samples in the minority
+                # class; shrink k_neighbors automatically for small classes
+                # instead of crashing
+                k_neighbors = min(5, minority_count - 1)
+
+                if k_neighbors < 1:
+
+                    balancing_note = (
+                        "SMOTE needs at least 2 samples in the minority class - "
+                        "this dataset's minority class is too small, so training "
+                        "proceeded without balancing. Try 'class_weight=balanced' "
+                        "instead for very small minority classes."
+                    )
+
                 else:
 
-                    # Check skewness
-                    skewness = data[col].skew()
+                    smote = SMOTE(k_neighbors=k_neighbors, random_state=42)
+                    X_train, y_train = smote.fit_resample(X_train, y_train)
 
-                    # Use Median if skewed
-                    if abs(skewness) >= 1:
-                        data[col] = data[col].fillna(
-                            data[col].median()
+            elif problem_type == "Classification" and imbalance_method.startswith("Oversample"):
+
+                train_combined = X_train.copy()
+                train_combined[target_column] = y_train.values
+
+                majority_size = train_combined[target_column].value_counts().max()
+
+                balanced_parts = []
+                for class_value, group in train_combined.groupby(target_column):
+                    balanced_parts.append(
+                        resample(
+                            group,
+                            replace=True,
+                            n_samples=majority_size,
+                            random_state=42
                         )
+                    )
 
-                    # Use Mean if approximately normal
+                train_balanced = pd.concat(balanced_parts).sample(
+                    frac=1, random_state=42
+                ).reset_index(drop=True)
+
+                X_train = train_balanced.drop(columns=[target_column])
+                y_train = train_balanced[target_column]
+
+            elif problem_type == "Classification" and imbalance_method.startswith("Undersample"):
+
+                train_combined = X_train.copy()
+                train_combined[target_column] = y_train.values
+
+                minority_size = train_combined[target_column].value_counts().min()
+
+                balanced_parts = []
+                for class_value, group in train_combined.groupby(target_column):
+                    balanced_parts.append(
+                        resample(
+                            group,
+                            replace=False,
+                            n_samples=minority_size,
+                            random_state=42
+                        )
+                    )
+
+                train_balanced = pd.concat(balanced_parts).sample(
+                    frac=1, random_state=42
+                ).reset_index(drop=True)
+
+                X_train = train_balanced.drop(columns=[target_column])
+                y_train = train_balanced[target_column]
+
+            # -----------------------------------
+            # TRAIN MODEL
+            # -----------------------------------
+
+            model.fit(
+                X_train,
+                y_train
+            )
+
+            # -----------------------------------
+            # PREDICTIONS
+            # -----------------------------------
+
+            predictions = model.predict(
+                X_test
+            )
+
+            # -----------------------------------
+            # METRICS (computed once, drawn below)
+            # -----------------------------------
+
+            metrics = {}
+            cm = None
+            class_labels = None
+            report_df = None
+            auc_error_message = None
+
+            if problem_type == "Regression":
+
+                metrics["MAE"] = mean_absolute_error(y_test, predictions)
+                metrics["RMSE"] = np.sqrt(
+                    mean_squared_error(y_test, predictions)
+                )
+                metrics["R² Score"] = r2_score(y_test, predictions)
+
+            else:
+
+                metrics["Accuracy"] = accuracy_score(y_test, predictions)
+
+                # ROC-AUC & PR-AUC - more reliable than raw accuracy on
+                # imbalanced data. PR-AUC especially, since it focuses on
+                # minority-class performance rather than overall correctness.
+                try:
+
+                    probabilities = model.predict_proba(X_test)
+                    n_classes = probabilities.shape[1]
+
+                    if n_classes == 2:
+                        metrics["ROC-AUC"] = roc_auc_score(
+                            y_test, probabilities[:, 1]
+                        )
+                        metrics["PR-AUC"] = average_precision_score(
+                            y_test, probabilities[:, 1]
+                        )
                     else:
-                        data[col] = data[col].fillna(
-                            data[col].mean()
+                        metrics["ROC-AUC"] = roc_auc_score(
+                            y_test, probabilities,
+                            multi_class="ovr", average="macro"
+                        )
+                        y_test_binarized = pd.get_dummies(y_test)
+                        metrics["PR-AUC"] = average_precision_score(
+                            y_test_binarized, probabilities, average="macro"
                         )
 
-        # -----------------------------------
-        # HANDLE TARGET COLUMN
-        # -----------------------------------
+                except Exception as auc_error:
+                    auc_error_message = str(auc_error)
 
-        target_encoder = None
+                cm = confusion_matrix(y_test, predictions)
 
-        unique_target_values = set(
-            data[target_column].dropna().unique()
-        )
+                class_labels = (
+                    list(target_encoder.classes_)
+                    if target_encoder is not None
+                    else sorted(y.unique())
+                )
 
-        # Binary numeric target (only 0 and 1) -> treat as classification,
-        # not regression, even though the dtype is numeric
-        is_binary_numeric_target = (
-            pd.api.types.is_numeric_dtype(data[target_column])
-            and len(unique_target_values) == 2
-            and unique_target_values.issubset({0, 1})
-        )
+                report_dict = classification_report(
+                    y_test,
+                    predictions,
+                    target_names=[str(c) for c in class_labels],
+                    output_dict=True,
+                    zero_division=0
+                )
 
-        if (
-            data[target_column].dtype == "object"
-            or data[target_column].dtype == "category"
-        ):
+                report_df = pd.DataFrame(report_dict).transpose().round(3)
 
-            target_encoder = LabelEncoder()
+            # -----------------------------------
+            # FEATURE IMPORTANCE
+            # -----------------------------------
 
-            data[target_column] = target_encoder.fit_transform(
-                data[target_column]
+            importance_df = pd.DataFrame({
+                "Feature": X.columns,
+                "Importance": model.feature_importances_
+            }).sort_values(
+                by="Importance",
+                ascending=False
             )
 
-            problem_type = "Classification"
+            top_10_features = importance_df.head(10)
 
-        elif is_binary_numeric_target:
+            # -----------------------------------
+            # PREDICTIONS FILE - decode labels back to original classes
+            # -----------------------------------
 
-            # Already 0/1, just make sure it's a clean integer type
-            data[target_column] = data[target_column].astype(int)
+            if problem_type == "Classification" and target_encoder is not None:
+                actual_decoded = target_encoder.inverse_transform(y_test)
+                predicted_decoded = target_encoder.inverse_transform(predictions)
+            else:
+                actual_decoded = y_test.values
+                predicted_decoded = predictions
 
-            problem_type = "Classification"
-
-        else:
-            problem_type = "Regression"
+            results_df = pd.DataFrame({
+                "Actual": actual_decoded,
+                "Predicted": predicted_decoded
+            })
 
         # -----------------------------------
-        # ENCODE OBJECT COLUMNS
+        # SAVE EVERYTHING TO SESSION STATE
         # -----------------------------------
 
-        categorical_columns = data.select_dtypes(
-            include=["object", "category"]
-        ).columns
+        st.session_state["results"] = {
+            "file_name": uploaded_file.name,
+            "target_column": target_column,
+            "problem_type": problem_type,
+            "data": data,
+            "raw_data_for_summary": raw_data_for_summary,
+            "capped_columns": capped_columns,
+            "balancing_note": balancing_note,
+            "metrics": metrics,
+            "auc_error_message": auc_error_message,
+            "cm": cm,
+            "class_labels": class_labels,
+            "report_df": report_df,
+            "cv_df": cv_df,
+            "cv_note": cv_note,
+            "top_10_features": top_10_features,
+            "model": model,
+            "scaler": scaler,
+            "feature_encoders": feature_encoders,
+            "X_test": X_test,
+            "y_test": y_test,
+            "predictions": predictions,
+            "results_df": results_df,
+            "imbalance_method": imbalance_method,
+            "apply_scaling": apply_scaling,
+            "shap_df": None,
+        }
 
-        feature_encoders = {}
+        # A new model makes any previous AI report out of date
+        st.session_state.pop("ai_report", None)
 
-        for col in categorical_columns:
+    # -----------------------------------
+    # SHOW RESULTS (from session_state - survives every rerun)
+    # -----------------------------------
 
-            encoder = LabelEncoder()
+    results = st.session_state.get("results")
 
-            data[col] = encoder.fit_transform(
-                data[col].astype(str)
+    # Forget results that belong to a different uploaded file
+    if results is not None and results["file_name"] != uploaded_file.name:
+        st.session_state.pop("results", None)
+        st.session_state.pop("ai_report", None)
+        results = None
+
+    if results is not None:
+
+        problem_type = results["problem_type"]
+        data = results["data"]
+        metrics = results["metrics"]
+
+        st.divider()
+
+        if results["target_column"] != target_column:
+            st.warning(
+                f"You changed the target to '{target_column}'. The results "
+                f"below are still for '{results['target_column']}' - click "
+                f"**Clean Data and Train Model** again to update them."
             )
 
-            feature_encoders[col] = encoder
+        if results["balancing_note"]:
+            st.warning(results["balancing_note"])
+
+        if results["capped_columns"]:
+            st.caption(
+                f"Outliers capped in: {results['capped_columns']} "
+                f"(small whole-number columns are skipped so counts stay whole)."
+            )
 
         # -----------------------------------
         # SHOW CLEANED DATA
@@ -894,223 +1594,21 @@ if uploaded_file is not None:
         )
 
         # -----------------------------------
-        # SPLIT FEATURES AND TARGET
-        # -----------------------------------
-
-        X = data.drop(
-            target_column,
-            axis=1
-        )
-
-        y = data[target_column]
-
-        # -----------------------------------
-        # TRAIN TEST SPLIT
-        # -----------------------------------
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X,
-            y,
-            test_size=0.2,
-            random_state=42
-        )
-
-        # -----------------------------------
-        # FEATURE SCALING
-        # -----------------------------------
-
-        scaler = None
-
-        if apply_scaling:
-
-            # Only scale columns that were originally numeric
-            # (leaves label-encoded categorical columns untouched)
-            numeric_feature_cols = [
-                col for col in numeric_cols if col in X.columns
-            ]
-
-            if len(numeric_feature_cols) > 0:
-
-                scaler = StandardScaler()
-
-                # Fit on train only, then transform both -
-                # avoids leaking test-set statistics into training
-                X_train.loc[:, numeric_feature_cols] = scaler.fit_transform(
-                    X_train[numeric_feature_cols]
-                )
-
-                X_test.loc[:, numeric_feature_cols] = scaler.transform(
-                    X_test[numeric_feature_cols]
-                )
-
-        # -----------------------------------
-        # CLASS IMBALANCE HANDLING
-        # -----------------------------------
-
-        # Only applies to classification, and only touches the TRAINING
-        # split - never the test split, so evaluation stays honest and
-        # reflects real-world class proportions.
-
-        if problem_type == "Classification" and imbalance_method.startswith("SMOTE"):
-
-            minority_count = y_train.value_counts().min()
-
-            # SMOTE needs at least k_neighbors+1 samples in the minority
-            # class; shrink k_neighbors automatically for small classes
-            # instead of crashing
-            k_neighbors = min(5, minority_count - 1)
-
-            if k_neighbors < 1:
-
-                st.warning(
-                    "SMOTE needs at least 2 samples in the minority class - "
-                    "this dataset's minority class is too small, so training "
-                    "proceeded without balancing. Try 'class_weight=balanced' "
-                    "instead for very small minority classes."
-                )
-
-            else:
-
-                smote = SMOTE(k_neighbors=k_neighbors, random_state=42)
-                X_train, y_train = smote.fit_resample(X_train, y_train)
-
-        elif problem_type == "Classification" and imbalance_method.startswith("Oversample"):
-
-            train_combined = X_train.copy()
-            train_combined[target_column] = y_train.values
-
-            majority_size = train_combined[target_column].value_counts().max()
-
-            balanced_parts = []
-            for class_value, group in train_combined.groupby(target_column):
-                balanced_parts.append(
-                    resample(
-                        group,
-                        replace=True,
-                        n_samples=majority_size,
-                        random_state=42
-                    )
-                )
-
-            train_balanced = pd.concat(balanced_parts).sample(
-                frac=1, random_state=42
-            ).reset_index(drop=True)
-
-            X_train = train_balanced.drop(columns=[target_column])
-            y_train = train_balanced[target_column]
-
-        elif problem_type == "Classification" and imbalance_method.startswith("Undersample"):
-
-            train_combined = X_train.copy()
-            train_combined[target_column] = y_train.values
-
-            minority_size = train_combined[target_column].value_counts().min()
-
-            balanced_parts = []
-            for class_value, group in train_combined.groupby(target_column):
-                balanced_parts.append(
-                    resample(
-                        group,
-                        replace=False,
-                        n_samples=minority_size,
-                        random_state=42
-                    )
-                )
-
-            train_balanced = pd.concat(balanced_parts).sample(
-                frac=1, random_state=42
-            ).reset_index(drop=True)
-
-            X_train = train_balanced.drop(columns=[target_column])
-            y_train = train_balanced[target_column]
-
-        # -----------------------------------
-        # SELECT MODEL
-        # -----------------------------------
-
-        if problem_type == "Regression":
-
-            model = RandomForestRegressor(
-                n_estimators=100,
-                random_state=42
-            )
-
-        else:
-
-            classifier_kwargs = {
-                "n_estimators": 100,
-                "random_state": 42
-            }
-
-            # class_weight='balanced' reweights errors on the minority class -
-            # no rows added or removed, just applied at model level
-            if imbalance_method.startswith("Use class_weight"):
-                classifier_kwargs["class_weight"] = "balanced"
-
-            # Custom cost-sensitive ratio - user-supplied weight per class
-            elif imbalance_method.startswith("Cost-sensitive") and custom_class_weights:
-                classifier_kwargs["class_weight"] = custom_class_weights
-
-            model = RandomForestClassifier(**classifier_kwargs)
-
-        # -----------------------------------
-        # TRAIN MODEL
-        # -----------------------------------
-
-        model.fit(
-            X_train,
-            y_train
-        )
-
-        # -----------------------------------
-        # PREDICTIONS
-        # -----------------------------------
-
-        predictions = model.predict(
-            X_test
-        )
-
-        # -----------------------------------
         # MODEL PERFORMANCE
         # -----------------------------------
 
-        st.subheader("Model Performance")
+        st.subheader("Model Performance (20% hold-out test set)")
+
+        y_test = results["y_test"]
+        predictions = results["predictions"]
 
         if problem_type == "Regression":
 
-            mae = mean_absolute_error(
-                y_test,
-                predictions
-            )
-
-            rmse = np.sqrt(
-                mean_squared_error(
-                    y_test,
-                    predictions
-                )
-            )
-
-            r2 = r2_score(
-                y_test,
-                predictions
-            )
-
             metric1, metric2, metric3 = st.columns(3)
 
-            metric1.metric(
-                "MAE",
-                round(mae, 2)
-            )
-
-            metric2.metric(
-                "RMSE",
-                round(rmse, 2)
-            )
-
-            metric3.metric(
-                "R² Score",
-                round(r2, 4)
-            )
+            metric1.metric("MAE", round(metrics["MAE"], 2))
+            metric2.metric("RMSE", round(metrics["RMSE"], 2))
+            metric3.metric("R² Score", round(metrics["R² Score"], 4))
 
             # -----------------------------------
             # RESIDUAL PLOT
@@ -1141,46 +1639,18 @@ if uploaded_file is not None:
 
         else:
 
-            accuracy = accuracy_score(
-                y_test,
-                predictions
-            )
-
             st.metric(
                 "Accuracy",
-                round(accuracy * 100, 2)
+                round(metrics["Accuracy"] * 100, 2)
             )
 
-            # -----------------------------------
-            # ROC-AUC & PR-AUC
-            # -----------------------------------
-            # More reliable than raw accuracy on imbalanced data -
-            # PR-AUC especially, since it focuses on minority-class
-            # performance rather than overall correctness.
-
-            try:
-
-                probabilities = model.predict_proba(X_test)
-                n_classes = probabilities.shape[1]
-
-                if n_classes == 2:
-                    roc_auc = roc_auc_score(y_test, probabilities[:, 1])
-                    pr_auc = average_precision_score(
-                        y_test, probabilities[:, 1]
-                    )
-                else:
-                    roc_auc = roc_auc_score(
-                        y_test, probabilities,
-                        multi_class="ovr", average="macro"
-                    )
-                    y_test_binarized = pd.get_dummies(y_test)
-                    pr_auc = average_precision_score(
-                        y_test_binarized, probabilities, average="macro"
-                    )
+            if "ROC-AUC" in metrics:
 
                 auc_col1, auc_col2 = st.columns(2)
-                auc_col1.metric("ROC-AUC", round(roc_auc, 4))
-                auc_col2.metric("PR-AUC (Avg Precision)", round(pr_auc, 4))
+                auc_col1.metric("ROC-AUC", round(metrics["ROC-AUC"], 4))
+                auc_col2.metric(
+                    "PR-AUC (Avg Precision)", round(metrics["PR-AUC"], 4)
+                )
 
                 st.caption(
                     "ROC-AUC and PR-AUC hold up better than raw accuracy "
@@ -1188,8 +1658,11 @@ if uploaded_file is not None:
                     "how well the model finds the minority class."
                 )
 
-            except Exception as auc_error:
-                st.info(f"Could not compute ROC-AUC/PR-AUC: {auc_error}")
+            elif results["auc_error_message"]:
+                st.info(
+                    f"Could not compute ROC-AUC/PR-AUC: "
+                    f"{results['auc_error_message']}"
+                )
 
             # -----------------------------------
             # CONFUSION MATRIX
@@ -1197,13 +1670,8 @@ if uploaded_file is not None:
 
             st.subheader("Confusion Matrix")
 
-            cm = confusion_matrix(y_test, predictions)
-
-            class_labels = (
-                target_encoder.classes_
-                if target_encoder is not None
-                else sorted(y.unique())
-            )
+            cm = results["cm"]
+            class_labels = results["class_labels"]
 
             fig, ax = plt.subplots(
                 figsize=(max(4, len(class_labels) * 0.8), max(4, len(class_labels) * 0.8))
@@ -1237,18 +1705,27 @@ if uploaded_file is not None:
             # -----------------------------------
 
             st.subheader("Classification Report")
+            st.dataframe(results["report_df"])
 
-            report_dict = classification_report(
-                y_test,
-                predictions,
-                target_names=[str(c) for c in class_labels],
-                output_dict=True,
-                zero_division=0
+        # -----------------------------------
+        # CROSS-VALIDATION RESULTS
+        # -----------------------------------
+
+        if results["cv_df"] is not None:
+
+            st.subheader("5-Fold Cross-Validation (training data)")
+
+            st.dataframe(results["cv_df"])
+
+            st.caption(
+                "Each fold trains on 4/5 of the training data and scores on "
+                "the remaining 1/5. A small Std means the score is stable and "
+                "doesn't depend on one lucky split. The test-set numbers above "
+                "should land close to these averages."
             )
 
-            report_df = pd.DataFrame(report_dict).transpose().round(3)
-
-            st.dataframe(report_df)
+        if results["cv_note"]:
+            st.info(results["cv_note"])
 
         # -----------------------------------
         # FEATURE IMPORTANCE
@@ -1256,17 +1733,7 @@ if uploaded_file is not None:
 
         st.subheader("Top 10 Important Features")
 
-        importance_df = pd.DataFrame({
-            "Feature": X.columns,
-            "Importance": model.feature_importances_
-        })
-
-        importance_df = importance_df.sort_values(
-            by="Importance",
-            ascending=False
-        )
-
-        top_10_features = importance_df.head(10)
+        top_10_features = results["top_10_features"]
 
         # Show table
         st.dataframe(top_10_features)
@@ -1296,7 +1763,8 @@ if uploaded_file is not None:
         # -----------------------------------
         # Generic for ANY tabular RandomForest model (classifier or
         # regressor, binary or multiclass) - not tied to specific column
-        # names or domains.
+        # names or domains. Works now because results live in
+        # session_state, so ticking the checkbox no longer wipes the page.
 
         st.subheader("Model Explainability (SHAP)")
 
@@ -1316,82 +1784,47 @@ if uploaded_file is not None:
 
             if run_shap:
 
-                with st.spinner("Computing SHAP values..."):
+                # Compute once per trained model, then reuse on reruns
+                if results["shap_df"] is None:
 
-                    try:
+                    with st.spinner("Computing SHAP values..."):
 
-                        # Cap sample size for speed - SHAP on tree models is
-                        # fast but still scales with rows x features x trees
-                        shap_sample = X_test.sample(
-                            n=min(200, len(X_test)),
-                            random_state=42
-                        )
+                        try:
+                            results["shap_df"] = compute_shap_importance(
+                                results["model"],
+                                results["X_test"]
+                            )
+                        except Exception as shap_error:
+                            st.info(f"Could not compute SHAP values: {shap_error}")
 
-                        explainer = shap.TreeExplainer(model)
-                        raw_shap_values = explainer.shap_values(shap_sample)
+                if results["shap_df"] is not None:
 
-                        # Normalize across shap API versions / binary vs
-                        # multiclass vs regression into one
-                        # (n_samples, n_features) array of attributions
-                        if isinstance(raw_shap_values, list):
-                            # Older API: list of per-class arrays
-                            if len(raw_shap_values) == 2:
-                                shap_matrix = raw_shap_values[1]
-                            else:
-                                shap_matrix = np.mean(
-                                    [np.abs(sv) for sv in raw_shap_values],
-                                    axis=0
-                                )
-                        else:
-                            shap_array = np.array(raw_shap_values)
-                            if shap_array.ndim == 3:
-                                # Newer API: (n_samples, n_features, n_classes)
-                                if shap_array.shape[-1] == 2:
-                                    shap_matrix = shap_array[:, :, 1]
-                                else:
-                                    shap_matrix = np.abs(shap_array).mean(axis=-1)
-                            else:
-                                shap_matrix = shap_array
+                    top_shap_features = results["shap_df"].head(10)
 
-                        mean_abs_shap = np.abs(shap_matrix).mean(axis=0)
+                    st.dataframe(top_shap_features)
 
-                        shap_importance_df = pd.DataFrame({
-                            "Feature": shap_sample.columns,
-                            "Mean |SHAP value|": mean_abs_shap
-                        }).sort_values(
-                            by="Mean |SHAP value|",
-                            ascending=False
-                        )
+                    fig, ax = plt.subplots()
 
-                        top_shap_features = shap_importance_df.head(10)
+                    ax.barh(
+                        top_shap_features["Feature"],
+                        top_shap_features["Mean |SHAP value|"]
+                    )
 
-                        st.dataframe(top_shap_features)
+                    ax.set_xlabel("Mean |SHAP value| (impact on prediction)")
+                    ax.set_ylabel("Features")
+                    ax.set_title("Top 10 Features by SHAP Impact")
+                    ax.invert_yaxis()
 
-                        fig, ax = plt.subplots()
+                    st.pyplot(fig)
 
-                        ax.barh(
-                            top_shap_features["Feature"],
-                            top_shap_features["Mean |SHAP value|"]
-                        )
-
-                        ax.set_xlabel("Mean |SHAP value| (impact on prediction)")
-                        ax.set_ylabel("Features")
-                        ax.set_title("Top 10 Features by SHAP Impact")
-                        ax.invert_yaxis()
-
-                        st.pyplot(fig)
-
-                        st.caption(
-                            "SHAP values show each feature's actual impact on "
-                            "individual predictions (signed and additive), "
-                            "unlike Random Forest's built-in importance which "
-                            "only reflects average split quality. The two "
-                            "rankings can differ - SHAP is generally the more "
-                            "trustworthy explanation for real-world decisions."
-                        )
-
-                    except Exception as shap_error:
-                        st.info(f"Could not compute SHAP values: {shap_error}")
+                    st.caption(
+                        "SHAP values show each feature's actual impact on "
+                        "individual predictions (signed and additive), "
+                        "unlike Random Forest's built-in importance which "
+                        "only reflects average split quality. The two "
+                        "rankings can differ - SHAP is generally the more "
+                        "trustworthy explanation for real-world decisions."
+                    )
 
         # -----------------------------------
         # FINAL INFORMATION
@@ -1420,20 +1853,7 @@ if uploaded_file is not None:
             mime="text/csv"
         )
 
-        # Predictions - decode labels back to original classes for classification
-        if problem_type == "Classification" and target_encoder is not None:
-            actual_decoded = target_encoder.inverse_transform(y_test)
-            predicted_decoded = target_encoder.inverse_transform(predictions)
-        else:
-            actual_decoded = y_test
-            predicted_decoded = predictions
-
-        results_df = pd.DataFrame({
-            "Actual": actual_decoded,
-            "Predicted": predicted_decoded
-        })
-
-        predictions_csv = results_df.to_csv(index=False).encode("utf-8")
+        predictions_csv = results["results_df"].to_csv(index=False).encode("utf-8")
 
         download_col2.download_button(
             label="⬇️ Predictions (CSV)",
@@ -1444,7 +1864,7 @@ if uploaded_file is not None:
 
         # Trained model
         model_buffer = io.BytesIO()
-        pickle.dump(model, model_buffer)
+        pickle.dump(results["model"], model_buffer)
 
         download_col3.download_button(
             label="⬇️ Trained Model (.pkl)",
@@ -1455,10 +1875,10 @@ if uploaded_file is not None:
 
         # Scaler (only exists if scaling was applied) - needed to transform
         # new data the same way before feeding it to the trained model
-        if scaler is not None:
+        if results["scaler"] is not None:
 
             scaler_buffer = io.BytesIO()
-            pickle.dump(scaler, scaler_buffer)
+            pickle.dump(results["scaler"], scaler_buffer)
 
             st.download_button(
                 label="⬇️ Fitted Scaler (.pkl)",
@@ -1467,28 +1887,9 @@ if uploaded_file is not None:
                 mime="application/octet-stream"
             )
 
-        # -----------------------------------
-        # SAVE RESULTS FOR GEMINI
-        # -----------------------------------
-        # NOTE: this must stay inside the "if st.button(...)" block,
-        # indented at this level, so it only runs right after training.
-        st.session_state["trained"] = True
-        st.session_state["data"] = data
-        st.session_state["problem_type"] = problem_type
-        st.session_state["target_column"] = target_column
-        st.session_state["top_10_features"] = top_10_features
-        st.session_state["model"] = model
-        st.session_state["X"] = X
-        st.session_state["y"] = y
-        st.session_state["predictions"] = predictions
-        st.session_state["df"] = df
-
     # -----------------------------------
     # GEMINI AI INSIGHTS
     # -----------------------------------
-    # NOTE: this is inside "if uploaded_file is not None:" but OUTSIDE the
-    # "if st.button(...)" block, so it stays visible (using session_state)
-    # across reruns, e.g. when the user clicks "Generate AI Insights".
 
     st.divider()
     st.subheader("🤖 Generative AI Insights")
@@ -1499,45 +1900,19 @@ if uploaded_file is not None:
             "Gemini API key not found. Please add GEMINI_API_KEY to your .env file."
         )
 
-    elif st.session_state.get("trained", False):
+    elif results is not None:
 
         if st.button("Generate AI Insights"):
 
-            data = st.session_state["data"]
-            target_column = st.session_state["target_column"]
-            problem_type = st.session_state["problem_type"]
-            top_10_features = st.session_state["top_10_features"]
-
-            dataset_summary = f"""
-Dataset Shape:
-{data.shape}
-
-Columns:
-{list(data.columns)}
-
-Data Types:
-{data.dtypes.to_string()}
-
-Missing Values:
-{data.isnull().sum().to_string()}
-
-Statistics:
-{data.describe(include='all').to_string()}
-
-Target Column:
-{target_column}
-
-Problem Type:
-{problem_type}
-
-Top 10 Important Features:
-{top_10_features.to_string(index=False)}
-"""
+            dataset_summary = build_gemini_summary(results)
 
             prompt = f"""
 You are a Senior Data Scientist.
 
-Analyze this dataset and produce a professional report.
+Analyze this dataset and the trained model's results, and produce a
+professional report. Use only the numbers given below - do not invent
+statistics. The data statistics describe the ORIGINAL data (before
+encoding and outlier capping).
 
 Include:
 
@@ -1549,13 +1924,11 @@ Include:
 
 4. Top Features
 
-5. Model Insights
+5. Model Insights (use the test-set and cross-validation metrics given)
 
 6. Business Insights
 
 7. Recommendations
-
-Dataset:
 
 {dataset_summary}
 """
@@ -1566,13 +1939,17 @@ Dataset:
 
                     response = gemini_model.generate_content(prompt)
 
-                    st.success("AI Analysis Generated Successfully")
-
-                    st.markdown(response.text)
+                    # Saved so the report survives later reruns
+                    st.session_state["ai_report"] = response.text
 
                 except Exception as e:
 
                     st.error(f"Gemini Error: {e}")
+
+        if st.session_state.get("ai_report"):
+
+            st.success("AI Analysis Generated Successfully")
+            st.markdown(st.session_state["ai_report"])
 
     else:
 

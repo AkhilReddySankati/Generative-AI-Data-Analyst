@@ -302,22 +302,7 @@ ai-data-analyst/
 
 ---
 
-## 📸 Screenshots
-
-Place captures in `docs/screenshots/` and reference them here:
-
-```markdown
-![Profiling](docs/screenshots/01-profiling.png)
-![Correlation heatmap](docs/screenshots/02-correlation.png)
-![SHAP](docs/screenshots/03-shap.png)
-![AI report](docs/screenshots/04-ai-report.png)
-```
-
-Worth capturing: the ID-leakage warning, the class-distribution chart with the
-SMOTE option, the SHAP plot, and the generated report.
-
----
-
+ 
 ## 🚀 Installation
 
 ```bash

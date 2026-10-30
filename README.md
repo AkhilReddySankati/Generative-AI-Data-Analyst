@@ -439,12 +439,6 @@ __pycache__/
 .ipynb_checkpoints/
 ```
 
-If a key has already been pushed, **revoke it** at `aistudio.google.com` and
-issue a new one. Removing the file in a later commit does not remove it from
-git history.
-
----
-
 <div align="center">
 
 **Built by [Akhil Reddy Sankati](https://github.com/akhil2203031050881)**
